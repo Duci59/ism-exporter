@@ -1,0 +1,9 @@
+opensearch:
+  url: "https://10.120.100.9:9200"
+  username: "admin"
+  password: "Poptech@123"
+  target_index: "logs-ism-opensearch-pop-write"
+  verify_ssl: false
+
+exporter:
+  interval_seconds: 300

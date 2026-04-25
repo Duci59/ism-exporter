@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+import requests
+import json
+import time
+import yaml
+import argparse
+import logging
+from datetime import datetime, timezone
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(levelname)s: %(message)s'
+)
+
+def load_config(config_path):
+    try:
+        with open(config_path, 'r') as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        logging.error(f"Không thể đọc file cấu hình: {e}")
+        exit(1)
+
+def get_ism_states(os_config):
+    try:
+        url = f"{os_config['url']}/_plugins/_ism/explain/*"
+        auth = (os_config['username'], os_config['password'])
+        response = requests.get(url, auth=auth, verify=os_config.get('verify_ssl', False), timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logging.error(f"Lỗi khi gọi API ISM: {e}")
+        return None
+
+def push_to_opensearch(bulk_data, os_config):
+    try:
+        url = f"{os_config['url']}/_bulk"
+        auth = (os_config['username'], os_config['password'])
+        headers = {"Content-Type": "application/x-ndjson"}
+        response = requests.post(url, auth=auth, verify=os_config.get('verify_ssl', False), headers=headers, data=bulk_data)
+        response.raise_for_status()
+        logging.info(f"Đã đẩy dữ liệu thành công. HTTP Status: {response.status_code}")
+    except Exception as e:
+        logging.error(f"Lỗi khi đẩy dữ liệu vào OpenSearch: {e}")
+
+def process_and_push(config):
+    os_config = config['opensearch']
+    ism_data = get_ism_states(os_config)
+
+    if not ism_data:
+        return
+
+    bulk_payload = ""
+    current_timestamp = datetime.now(timezone.utc).isoformat()
+    target_index = os_config.get('target_index', 'ism-state-logs')
+
+    for index_name, details in ism_data.items():
+        if not isinstance(details, dict):
+            continue
+
+        policy_id = details.get("policy_id") or details.get("index.policy_id") or details.get("index.plugins.index_state_management.policy_id")
+        if not policy_id:
+            continue
+
+        state = details.get("state", {}).get("name", "N/A")
+        action = details.get("action", {}).get("name", "N/A")
+        info_message = details.get("info", {}).get("message", "")
+
+        doc = {
+            "@timestamp": current_timestamp,
+            "index_name": index_name,
+            "policy_id": policy_id,
+            "state": state,
+            "action": action,
+            "info_message": info_message
+        }
+
+        action_meta = { "index": { "_index": target_index } }
+        bulk_payload += json.dumps(action_meta) + "\n"
+        bulk_payload += json.dumps(doc) + "\n"
+
+    if bulk_payload:
+        push_to_opensearch(bulk_payload, os_config)
+    else:
+        logging.info("Không có index nào đang áp dụng ISM Policy.")
+
+def main():
+    parser = argparse.ArgumentParser(description='ISM State Exporter for OpenSearch')
+
+    parser.add_argument('--config.file', dest='config_file', default='/etc/ism_exporter/config.yml', help='Đường dẫn tới file cấu hình YAML')
+    args = parser.parse_args()
+
+    config = load_config(args.config_file)
+    interval = config.get('exporter', {}).get('interval_seconds', 300)
+
+    logging.info(f"Khởi động ISM Exporter. Đang lấy dữ liệu mỗi {interval} giây...")
+
+    while True:
+        process_and_push(config)
+        time.sleep(interval)
+
+if __name__ == "__main__":
+    main()
